@@ -1,0 +1,69 @@
+// Cloudflare Worker config for the whatiiif MCP server.
+//
+// Before the first deploy, set CONTACT and PUBLIC_ORIGIN below. The server
+// refuses to run without a real CONTACT. See README.md, "Before you deploy".
+//
+// Deploy from this directory: npx wrangler deploy
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "whatiiif-mcp",
+  "main": "src/index.js",
+  "compatibility_date": "2026-09-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+
+  // Rate limiting. Counters are per Cloudflare location and eventually
+  // consistent, which is the right strength for politeness: the point is to
+  // never burst an institution, not to meter exactly.
+  //   HOST_LIMITER           keyed by upstream hostname, i.e. per institution
+  //   HOST_LIMITER_UNCACHED  the same, used instead while PUBLIC_ORIGIN is a
+  //                          workers.dev address, where nothing is cached
+  //   CLIENT_LIMITER         keyed by caller IP, protects this server
+  // Every deployment of this software has its own budget against the same
+  // institutions, so these are deliberately low. Raise HOST_LIMITER only if
+  // you have real users running into it, and not above what you would be
+  // comfortable explaining to the institution.
+  // The caller IP for /mcp is the chat host's server, not the person, so
+  // everyone on one host shares a CLIENT_LIMITER budget.
+  // namespace_id is any integer that is unique within your account.
+  // The numbers are also quoted in README.md, the 429 text in src/index.js and
+  // the pacing note in src/tools/get_thumbnails.js: change them together.
+  "ratelimits": [
+    { "name": "HOST_LIMITER", "namespace_id": "1001", "simple": { "limit": 30, "period": 60 } },
+    { "name": "HOST_LIMITER_UNCACHED", "namespace_id": "1002", "simple": { "limit": 10, "period": 60 } },
+    { "name": "CLIENT_LIMITER", "namespace_id": "1003", "simple": { "limit": 60, "period": 60 } }
+  ],
+
+  "vars": {
+    // REQUIRED. Who runs this deployment: an https URL or an email address
+    // where an institution can reach you. It is sent in the User-Agent of
+    // every request this server makes, so use an address you read.
+    "CONTACT": "",
+
+    // REQUIRED. The address clients reach this Worker at, scheme included.
+    // The viewer panel loads its images from {PUBLIC_ORIGIN}/img and declares
+    // that origin to the host, so it must be exact and must change if the
+    // route does. Not derived from the request: under `wrangler dev` the
+    // request URL reports the route's hostname over http, which is neither
+    // the local address nor the real one. For local testing, override it in
+    // .dev.vars (see .dev.vars.example).
+    "PUBLIC_ORIGIN": "https://whatiiif-mcp.YOUR-SUBDOMAIN.workers.dev",
+
+    // "true": every URL the server works out for itself (handler lookups,
+    // derived manifest URLs, page-scan probes) is checked against robots.txt.
+    // Leave it on. "false" is for a private deployment whose operator has an
+    // institution's permission.
+    "RESPECT_ROBOTS": "true",
+
+    // "true" adds Biblissima to the search tool. It has no API, so this reads
+    // its HTML results page. Ask Biblissima before enabling it on a server
+    // other people use.
+    "ENABLE_BIBLISSIMA_SEARCH": "false"
+  }
+
+  // To serve from your own domain (recommended: the Cache API only persists
+  // on a custom domain, so on workers.dev every upstream response is fetched
+  // fresh), create a proxied DNS record for the name in the dashboard, set
+  // PUBLIC_ORIGIN to match, and add:
+  // , "routes": [{ "pattern": "mcp.example.org/*", "zone_name": "example.org" }]
+}

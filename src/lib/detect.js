@@ -1,0 +1,1007 @@
+/* detect.js: IIIF manifest detection.
+   Pure functions and a table of institution handlers (PLATFORMS) that turn an
+   item page URL into a IIIF manifest URL, plus the page-scan heuristics and the
+   canvas and image-service helpers the tools use.
+
+   The same library runs in the Sniiiffer browser extension, which is why the
+   handlers call a bare fetch(). In this server that call is routed through
+   polite.js, so every lookup is identified, cached, rate limited and checked
+   against robots.txt.
+*/
+
+const SNIIIFFER_PROBE_CAP = 8; // max network probes per deep scan — capped for politeness
+const WHATIIIF_BASE = 'https://whatiiif.com';
+
+/* ── manifest validation (verbatim from whatiiif) ── */
+function looksLikeManifest(data) {
+  if (!data || typeof data !== 'object') return false;
+  if (/iiif\.io\/api\/presentation/.test(JSON.stringify(data['@context'] || ''))) return true;
+  const type = data['@type'] || data.type || '';
+  return type === 'sc:Manifest' || type === 'Manifest' || type === 'sc:Collection' || type === 'Collection';
+}
+
+/* ── IIIF Content State API 1.0 encoding/decoding (from whatiiif) ── */
+function encodeContentState(json) {
+  const uriEncoded = encodeURIComponent(json);
+  const b64 = btoa(uriEncoded);
+  return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+}
+
+// A content state referencing a whole Manifest (spec §2.2.2) — the token form
+// other viewers accept via ?iiif-content=. Round-trips through
+// parseContentState below.
+function buildManifestContentState(manifestUrl) {
+  return encodeContentState(JSON.stringify({
+    '@context': 'http://iiif.io/api/presentation/3/context.json',
+    id: manifestUrl,
+    type: 'Manifest'
+  }));
+}
+
+// A content state targeting a specific Canvas (spec §2.2.1 Annotation form,
+// same shape whatiiif's buildContentStateAnnotation emits). xywh ("x,y,w,h",
+// in the full image-pixel space whatiiif's selection UI uses) and label (the
+// user's caption, spec language-map form whatiiif round-trips) are optional —
+// present only for highlight-region states.
+function buildCanvasContentState(manifestUrl, canvasId, xywh, label) {
+  const annotation = {
+    '@context': 'http://iiif.io/api/presentation/3/context.json',
+    id: manifestUrl + '#content-state',
+    type: 'Annotation',
+    motivation: ['contentState'],
+    target: {
+      id: canvasId + (xywh ? '#xywh=' + xywh : ''),
+      type: 'Canvas',
+      partOf: [{ id: manifestUrl, type: 'Manifest' }]
+    }
+  };
+  if (label) annotation.label = { none: [label] };
+  return encodeContentState(JSON.stringify(annotation));
+}
+
+// whatiiif's own share-link form for a highlighted region — byte-identical to
+// what its updateUrl() generates (?manifest=&canvas=&xywh=[&label=][&svc=][&rot=]).
+// svc lets whatiiif render the highlight even when the manifest itself is
+// proxy-blocked there. rot carries the orientation the region was drawn at, so
+// the landing page shows the page the same way up; it is presentational only —
+// xywh is always in the canvas's unrotated pixel space — and is omitted at 0°.
+function buildWhatiiifHighlightUrl(manifestUrl, canvasIdx, xywh, label, svcBase, rot) {
+  const p = new URLSearchParams({ manifest: manifestUrl, canvas: String(canvasIdx), xywh: xywh });
+  if (label) p.set('label', label);
+  if (svcBase) p.set('svc', svcBase);
+  if (rot) p.set('rot', String(rot));
+  return WHATIIIF_BASE + '/?' + p.toString();
+}
+
+/* ── page awareness: which canvas is the viewer showing? ──
+   Extracts a canvas index from viewer-URL conventions. Deliberately
+   conservative: only params/paths that are page positions on their platform.
+   Generic ?page=/?seq= are skipped — on arbitrary sites they're usually
+   search-result pagination, and a wrong canvas target is worse than none.
+   Returns { index } (0-based), { canvasId } (resolved against the manifest
+   later by resolveHintIndex), or null. */
+function extractPageHint(pageUrl) {
+  let m;
+  // Harvard viewer: ?canvasId=<absolute canvas URI>. This is a canvas
+  // IDENTITY, not a position, so it can't become an index without the
+  // manifest — resolveHintIndex does that where the manifest is already in
+  // hand. Checked before the generic cv= rule below: Harvard URLs carry both
+  // manifestId and canvasId, and neither is a cv= param.
+  if (/viewer\.lib\.harvard\.edu\//.test(pageUrl) && (m = pageUrl.match(/[?&]canvasId=([^&#]+)/))) {
+    let cid = m[1];
+    try { cid = decodeURIComponent(cid); } catch (e) {}
+    if (/^https?:\/\//.test(cid)) return { canvasId: cid };
+  }
+  // CONTENTdm: /digital/collection/{col}/id/{n} — for a COMPOUND object the
+  // /id/ is the child (page) pointer, and the manifest we resolve to is the
+  // parent's. Another identity hint: CONTENTdm canvas ids embed the pointer
+  // as '{collection}:{pointer}/canvas/cN', where cN is positional, so the
+  // pointer is the only part that identifies the page. Single-item objects
+  // resolve to their own manifest, where this pointer won't be found — that
+  // yields -1, i.e. no hint, which is correct.
+  if ((m = pageUrl.match(/\/digital\/collection\/([^\/]+)\/id\/(\d+)/))) {
+    return { cdmCollection: m[1], cdmPointer: m[2] };
+  }
+  // Library of Congress: ?sp=13 (1-based sequence position)
+  if (/\bloc\.gov\//.test(pageUrl) && (m = pageUrl.match(/[?&]sp=(\d+)/))) {
+    return { index: Math.max(0, parseInt(m[1], 10) - 1) };
+  }
+  // Cambridge CUDL: /view/{id}/42 (1-based path segment)
+  if ((m = pageUrl.match(/cudl\.lib\.cam\.ac\.uk\/view\/[^\/\?#]+\/(\d+)/))) {
+    return { index: Math.max(0, parseInt(m[1], 10) - 1) };
+  }
+  // Internet Archive BookReader: /page/n5 (n-prefixed = 0-based leaf, which
+  // maps ~1:1 onto IA IIIF canvases; bare /page/5 is a PRINTED page number
+  // with no reliable canvas mapping, so only the n-form is used)
+  if (/archive\.org\/details\//.test(pageUrl) && (m = pageUrl.match(/\/page\/n(\d+)/))) {
+    return { index: parseInt(m[1], 10) };
+  }
+  // Universal Viewer: #?cv=12 (0-based canvas index; UV runs on many domains,
+  // often inside an iframe — the all-frames content script sees its live URL).
+  // m= is UV's volume index within a collection: carried along so multi-volume
+  // works can target the right volume (or bail rather than target the wrong one).
+  if ((m = pageUrl.match(/[?&#]cv=(\d+)/))) {
+    const mi = pageUrl.match(/[?&#]m=(\d+)/);
+    return { index: parseInt(m[1], 10), manifestIndex: mi ? parseInt(mi[1], 10) : 0 };
+  }
+  // whatiiif share links: ?canvas=3 (0-based)
+  if ((m = pageUrl.match(/[?&]canvas=(\d+)/))) {
+    return { index: parseInt(m[1], 10) };
+  }
+  return null;
+}
+
+// v2 (sequences) vs v3 (items) — faithful port of whatiiif's getCanvases
+function getCanvases(m) {
+  if (m.sequences && m.sequences[0]) return m.sequences[0].canvases || [];
+  return m.items || [];
+}
+
+/* ── two-page spreads ──
+   A bound volume is displayed two pages at a time. IIIF says so with
+   behavior:"paged" on the manifest (v3) or viewingHint:"paged" (v2) — we do
+   NOT infer it: single-sheet material (maps, photographs, broadsides) is
+   multi-canvas too, and pairing those is wrong.
+
+   The pairing rule is from the Presentation API: the first canvas stands alone
+   (it is the cover / first recto), then canvases pair up 1-2, 3-4, 5-6. A
+   canvas may opt out with its own behavior:"non-paged", which is how
+   already-two-up scans (fold-outs) are meant to be marked.
+
+   DISPLAY ONLY. A selection's xywh lives in one canvas's own pixel space, and
+   paired canvases do not share dimensions (measured on real scans: 6545 vs
+   6538 high in one pair, and no pair matched exactly). There is no shared
+   coordinate space for a spread, so a box is always stored against a single
+   canvas. Spreads change what the user SEES, never what gets recorded. */
+function isPagedManifest(m) {
+  if (!m) return false;
+  const b = m.behavior || m.viewingHint;
+  const arr = Array.isArray(b) ? b : [b];
+  return arr.indexOf('paged') !== -1;
+}
+
+function isNonPagedCanvas(c) {
+  if (!c) return false;
+  const b = c.behavior || c.viewingHint;
+  const arr = Array.isArray(b) ? b : [b];
+  return arr.indexOf('non-paged') !== -1 || arr.indexOf('facing-pages') !== -1;
+}
+
+/* The spread containing canvas `idx`, as an array of indices in display order
+   (left to right, or right to left for viewingDirection right-to-left).
+   Returns a single-element array whenever pairing doesn't apply, so callers
+   can treat every view as "a list of canvases to show" without branching. */
+function spreadFor(m, idx, canvases) {
+  const cvs = canvases || getCanvases(m);
+  if (!cvs.length) return [];
+  const i = Math.max(0, Math.min(idx | 0, cvs.length - 1));
+  if (!isPagedManifest(m)) return [i];
+  if (i === 0) return [0];                       // cover stands alone
+  if (isNonPagedCanvas(cvs[i])) return [i];      // already a two-up scan
+  // Pairs are (1,2), (3,4), … — odd index is the left page of its pair.
+  const left = (i % 2 === 1) ? i : i - 1;
+  const right = left + 1;
+  if (right >= cvs.length) return [left];
+  // A neighbour that opts out breaks the pair rather than joining it.
+  if (isNonPagedCanvas(cvs[left]) || isNonPagedCanvas(cvs[right])) return [i];
+  const pair = [left, right];
+  const dir = m.viewingDirection || '';
+  return dir === 'right-to-left' ? [right, left] : pair;
+}
+
+// Collections have sub-manifests, not canvases — whatiiif (and most viewers)
+// can't render them directly. collectionManifests lists the volume URLs
+// (v2 manifests / v3 items), unwrapCollection is the volume-1 policy.
+function collectionManifests(m) {
+  const type = m['@type'] || m.type || '';
+  if (type !== 'sc:Collection' && type !== 'Collection') return [];
+  if (Array.isArray(m.manifests)) {
+    return m.manifests.map(function (x) { return x['@id'] || x.id; }).filter(Boolean); // v2
+  }
+  if (Array.isArray(m.items)) {
+    return m.items
+      .filter(function (it) { return (it.type || it['@type']) === 'Manifest'; })
+      .map(function (it) { return it.id || it['@id']; })
+      .filter(Boolean); // v3
+  }
+  return [];
+}
+function unwrapCollection(m) {
+  return collectionManifests(m)[0] || null;
+}
+
+function canvasIdOf(canvas) {
+  return (canvas && (canvas.id || canvas['@id'])) || null;
+}
+
+/* Turn a hint into a concrete canvas index against a fetched manifest.
+   Index hints pass straight through; canvasId hints (Harvard) are matched
+   against the manifest's canvases. Matching is exact-URI first, then the
+   tail after '/canvas/': the same object is served from several Harvard
+   hosts (nrs / mps / iiif.lib) and the viewer URL may name a different one
+   than the manifest does, but the canvas tail is stable across them
+   (verified against URN-3:FHCL.HOUGH:12007389 on both nrs and mps).
+   Returns a 0-based index, or -1 when the hint can't be placed — callers
+   treat that as "no hint" rather than guessing a page. */
+function resolveHintIndex(hint, canvases) {
+  if (!hint || !canvases || !canvases.length) return -1;
+  if (typeof hint.index === 'number') {
+    return (hint.index >= 0 && hint.index < canvases.length) ? hint.index : -1;
+  }
+  // CONTENTdm pointer → the canvas whose id embeds ':{pointer}/canvas/'.
+  // Anchored on both sides deliberately: a bare substring test is wildly
+  // unsafe here because pointers are plain integers sharing a numeric space
+  // (on ISU p15990coll5, pointers run 879..1010, so "90" substring-matches
+  // all 132 canvases while ":90/canvas/" matches none). NOT handled by the
+  // canvasId tail path below — CONTENTdm's /canvas/cN tail is POSITIONAL,
+  // so tail matching would silently return the wrong page.
+  if (hint.cdmPointer) {
+    const needle = ':' + hint.cdmPointer + '/canvas/';
+    for (let k = 0; k < canvases.length; k++) {
+      if (String(canvasIdOf(canvases[k]) || '').indexOf(needle) !== -1) return k;
+    }
+    return -1;
+  }
+  /* Image-API hint (Mirador, Clover): these viewers keep the open canvas in
+     JS state — Redux / React — which an isolated-world content script cannot
+     read, and neither puts it in the URL. What they DO expose is the rendered
+     image: every tile and thumbnail they request is an Image API URL, and an
+     Image API URL always begins with the canvas's service base. So the
+     service base of a rendered image identifies the canvas, and getServiceBase
+     gives us the same value from the manifest side.
+     Matched exactly, not by substring: service bases in one manifest routinely
+     share a long prefix (…/iiif/2/book%2F0011 vs …%2F0111), and a prefix test
+     picks the wrong page. Ambiguity is resolved as no-hint, never a guess. */
+  if (hint.imgServiceBase) {
+    const want = String(hint.imgServiceBase).replace(/\/+$/, '');
+    let hitIdx = -1;
+    for (let k = 0; k < canvases.length; k++) {
+      const b = getServiceBase(canvases[k]);
+      if (!b) continue;
+      if (String(b).replace(/\/+$/, '') !== want) continue;
+      if (hitIdx !== -1) return -1; // two canvases share a base — can't disambiguate
+      hitIdx = k;
+    }
+    return hitIdx;
+  }
+  if (!hint.canvasId) return -1;
+  let i;
+  for (i = 0; i < canvases.length; i++) {
+    if (canvasIdOf(canvases[i]) === hint.canvasId) return i;
+  }
+  const tailOf = function (id) {
+    const parts = String(id || '').split('/canvas/');
+    return parts.length > 1 ? parts[parts.length - 1] : null;
+  };
+  const want = tailOf(hint.canvasId);
+  if (!want) return -1;
+  for (i = 0; i < canvases.length; i++) {
+    if (tailOf(canvasIdOf(canvases[i])) === want) return i;
+  }
+  return -1;
+}
+
+/* Canvas to image plumbing. */
+
+// IIIF v3 servers use 'max' instead of 'full' for full resolution
+function fullSizeParam(svcBase) {
+  return (svcBase && svcBase.indexOf('/iiif/3/') !== -1) ? 'max' : 'full';
+}
+
+// Image API service base for a canvas (v2 images / v3 annotation body),
+// falling back to the resource URL's stem when no service is declared.
+// An Image API URL always ends {region}/{size}/{rotation}/{quality}.{format},
+// so strip exactly those four segments. Anchoring on that tail matters: a
+// greedy match on "full" keeps "/full/max" in the base and every derived URL
+// then 404s.
+const IMG_API_TAIL = /^(.+?)\/[^\/]+\/[^\/]+\/[^\/]+\/[^\/]+\.[a-z]+$/i;
+
+function getServiceBase(canvas) {
+  if (canvas.images && canvas.images[0]) {
+    const res = canvas.images[0].resource || {};
+    const svc = res.service;
+    if (svc) { const id = svc['@id'] || svc.id; if (typeof id === 'string' && id) return id.replace(/\/+$/, ''); }
+    const rid = res['@id'] || res.id || '';
+    const m = rid.match(IMG_API_TAIL);
+    if (m) return m[1];
+    return rid.replace(/\/+$/, '');
+  }
+  if (canvas.items && canvas.items[0] && canvas.items[0].items && canvas.items[0].items[0]) {
+    const body = canvas.items[0].items[0].body || {};
+    const s = Array.isArray(body.service) ? body.service[0] : body.service;
+    if (s) { const sid = s['@id'] || s.id; if (typeof sid === 'string' && sid) return sid.replace(/\/+$/, ''); }
+    const bid = body.id || body['@id'] || '';
+    const m2 = bid.match(IMG_API_TAIL);
+    if (m2) return m2[1];
+    return bid.replace(/\/+$/, '');
+  }
+  return null;
+}
+
+function iiifUrl(base, region, size) {
+  return base.replace(/\/+$/, '') + '/' + region + '/' + (size || '800,') + '/0/default.jpg';
+}
+
+// Full-pixel dimensions of the canvas — the coordinate space whatiiif's xywh
+// values live in. Includes whatiiif's LoC fix: some institutions report
+// canvas dims at a pct:-reduced derivative scale.
+function getCanvasDimensions(canvas) {
+  let cW = canvas.width || 1000;
+  let cH = canvas.height || 1400;
+  const images = canvas.images || [];
+  if (images[0]) {
+    const res = images[0].resource || {};
+    const rid = res['@id'] || res.id || '';
+    const pct = rid.match(/\/pct:([\d.]+)\//);
+    // Only scale up when the canvas reports the derivative's reduced dims.
+    // ChronAm canvases report full-res dims alongside a pct:12.5 resource —
+    // scaling those up 8x misplaces the highlight rect.
+    if (pct && (!res.width || Math.abs(cW - res.width) <= cW * 0.05)) {
+      const scale = 100 / parseFloat(pct[1]);
+      cW = Math.round(cW * scale);
+      cH = Math.round(cH * scale);
+    }
+  }
+  return { cW: cW, cH: cH };
+}
+
+/* Display-image candidates for a canvas, strongest first. The highlight
+   overlay walks the list on <img> error: a sized service request first
+   (level-1 syntax, fast), the service's full-resolution form, then the
+   painted resource itself (also rescues the no-service case, where
+   getServiceBase returns a plain image URL that the Image-API forms 404 on). */
+function canvasImageUrls(canvas) {
+  const urls = [];
+  const svc = getServiceBase(canvas);
+  if (svc) {
+    urls.push(iiifUrl(svc, 'full', '1600,'));
+    urls.push(iiifUrl(svc, 'full', fullSizeParam(svc)));
+  }
+  let direct = null;
+  if (canvas.images && canvas.images[0]) {
+    const res = canvas.images[0].resource || {};
+    direct = res['@id'] || res.id || null;
+  } else if (canvas.items && canvas.items[0] && canvas.items[0].items && canvas.items[0].items[0]) {
+    const body = canvas.items[0].items[0].body || {};
+    direct = body.id || body['@id'] || null;
+  }
+  if (direct && urls.indexOf(direct) === -1) urls.push(direct);
+  return urls;
+}
+
+function decodeContentState(s) {
+  const pad = s.length % 4;
+  if (pad === 1) throw new Error('Invalid content state length');
+  if (pad) s += '===='.slice(0, 4 - pad);
+  const b64 = s.replace(/-/g, '+').replace(/_/g, '/');
+  return decodeURIComponent(atob(b64));
+}
+
+function parseContentState(raw) {
+  if (!raw) return null;
+  if (/^https?:\/\//i.test(raw)) {
+    return { manifestId: raw, canvasId: null, xywh: null };
+  }
+  let json;
+  try { json = JSON.parse(decodeContentState(raw)); }
+  catch (e) { return null; }
+  let target = (json.motivation === 'contentState' || (Array.isArray(json.motivation) && json.motivation.indexOf('contentState') > -1))
+    ? json.target
+    : json;
+  if (Array.isArray(target)) target = target[0];
+  if (!target || !target.id) return null;
+  let manifestId = null;
+  if (target.type === 'Manifest') {
+    manifestId = target.id;
+  } else if (Array.isArray(target.partOf)) {
+    const mp = target.partOf.find(function (p) { return p.type === 'Manifest'; });
+    if (mp) manifestId = mp.id;
+  } else if (target.partOf && target.partOf.type === 'Manifest') {
+    manifestId = target.partOf.id;
+  }
+  return manifestId ? { manifestId: manifestId } : null;
+}
+
+/* Signposting Link header: the manifest named by a rel="alternate" link. */
+function parseSignpostingManifest(linkHeader) {
+  if (!linkHeader) return null;
+  const entries = linkHeader.split(/,(?=\s*<)/);
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    const urlMatch = entry.match(/<([^>]+)>/);
+    if (!urlMatch) continue;
+    if (!/rel="?alternate"?/i.test(entry)) continue;
+    if (!/profile="[^"]*iiif\.io\/api\/presentation[^"]*"|type="application\/ld\+json"/i.test(entry)) continue;
+    return urlMatch[1];
+  }
+  return null;
+}
+
+/* BookReader path keywords that follow /details/{item} directly. Anything else
+   in that position is a file name inside a multi-file item. Kept as one
+   anchored list so the IA handler and extractPageHint agree on what a "file"
+   segment is. */
+const IA_READER_SEGMENTS = /^(?:page|mode|search|theater|1up|2up|thumb|fullscreen)$/i;
+
+/* ── PLATFORMS — URL pattern → manifest URL.
+   Order matters: first match wins (same contract as whatiiif). Sync resolvers
+   are pure (safe in the content script, zero network); async ones fetch and
+   only run in the background service worker on deep scan. ── */
+const PLATFORMS = [
+
+  // Viewer share links (Theseus, Mirador, UV, whatiiif): ?manifest= / #?manifest=.
+  // DASH/HLS video players use ?manifest= too, and those are never IIIF.
+  {
+    name: 'IIIF viewer link',
+    pattern: /[?&#]manifest=/,
+    resolve: function (url) {
+      const m = url.match(/[?&#]manifest=([^&#\s]+)/);
+      if (!m) return null;
+      try {
+        const dec = decodeURIComponent(m[1]);
+        if (!/^https?:\/\//.test(dec)) return null;
+        return looksLikeVideoManifest(dec) ? null : dec;
+      } catch (e) { return null; }
+    }
+  },
+
+  // Direct manifest URL — the page itself; content.js confirms by parsing the body
+  {
+    name: 'Direct manifest URL',
+    pattern: /manifest(\.json)?(\?|#|$)/,
+    resolve: function (url) { return url; }
+  },
+
+  // Illinois State University, Circus Route Books compound objects: a child
+  // page resolves to its parent's manifest, found through dmwebservices.
+  {
+    name: 'Illinois State University (Circus Route Books)',
+    pattern: /digital\.library\.illinoisstate\.edu\/digital\/collection\/p15990coll5\/id\/(\d+)/,
+    async: true,
+    resolve: async function (url) {
+      const m = url.match(/^(https?:\/\/[^\/]+).*\/digital\/collection\/(p15990coll5)\/id\/(\d+)/);
+      if (!m) return null;
+      const host = m[1], col = m[2], id = m[3];
+      const childManifest = host + '/iiif/info/' + col + '/' + id + '/manifest.json';
+      try {
+        const r = await fetch(host + '/digital/bl/dmwebservices/index.php?q=GetParent/' + col + '/' + id + '/json');
+        if (!r.ok) return childManifest;
+        const data = await r.json();
+        const parent = parseInt(data && data.parent, 10);
+        if (parent > 0) return host + '/iiif/info/' + col + '/' + parent + '/manifest.json';
+      } catch (e) {}
+      return childManifest;
+    }
+  },
+
+  // CONTENTdm — any domain
+  {
+    name: 'CONTENTdm',
+    pattern: /\/digital\/collection\/([^\/]+)\/id\/(\d+)/,
+    resolve: function (url) {
+      const m = url.match(/^(https?:\/\/[^\/]+).*\/digital\/collection\/([^\/]+)\/id\/(\d+)/);
+      if (!m) return null;
+      return m[1] + '/iiif/info/' + m[2] + '/' + m[3] + '/manifest.json';
+    }
+  },
+
+  /* Internet Archive.
+     Two shapes. /details/{item} is the normal case: iiif.archive.org mints a
+     manifest per item and it is correct.
+     /details/{item}/{file} names one work inside a MULTI-FILE item (a single
+     item can bundle dozens of issues of one periodical as separate file sets).
+     For those, IA's item manifest is not just wrong for the requested file, it
+     is internally inconsistent — verified 2026-07-30 on a 30-issue item: its
+     label described the whole collection, all 102 canvases came from one
+     issue, and rendering/seeAlso pointed at a third file. Returning it yields a confident,
+     shareable highlight of the WRONG work, which is how this was found (right
+     page number, wrong issue). whatiiif's /ia-manifest route synthesizes a
+     correct manifest from the Image API instead.
+     The second segment is only a file when it is not a BookReader keyword:
+     /page/nN, /mode/2up, /search/… all follow the item directly. */
+  {
+    name: 'Internet Archive',
+    pattern: /archive\.org\/details\/([^\/\?#]+)/,
+    resolve: function (url) {
+      const m = url.match(/archive\.org\/details\/([^\/\?#]+)(?:\/([^\/\?#]+))?/);
+      if (!m) return null;
+      const item = m[1];
+      const seg2 = m[2] ? decodeURIComponent(m[2]) : '';
+      if (seg2 && !IA_READER_SEGMENTS.test(seg2)) {
+        return WHATIIIF_BASE + '/ia-manifest?item=' + encodeURIComponent(item) +
+               '&file=' + encodeURIComponent(seg2);
+      }
+      return 'https://iiif.archive.org/iiif/' + item + '/manifest.json';
+    }
+  },
+
+  // Harvard viewer — ?manifestId= or canvasId=
+  {
+    name: 'Harvard Digital Collections',
+    pattern: /viewer\.lib\.harvard\.edu\/viewer/,
+    resolve: function (url) {
+      const m = url.match(/[?&]manifestId=([^&]+)/);
+      if (m) return decodeURIComponent(m[1]);
+      const c = url.match(/[?&]canvasId=([^&]+)/);
+      if (c) {
+        const canvas = decodeURIComponent(c[1]);
+        return canvas.replace(/\/canvas\/[^/]+$/, '');
+      }
+      return null;
+    }
+  },
+
+  // Harvard nrs URN manifests
+  {
+    name: 'Harvard Digital Collections',
+    pattern: /nrs\.lib\.harvard\.edu\/URN-3:[^?#\s]+:MANIFEST/i,
+    resolve: function (url) {
+      const m = url.match(/(https?:\/\/nrs\.lib\.harvard\.edu\/URN-3:[^?#\s]+:MANIFEST:\d+)/i);
+      return m ? m[1] : null;
+    }
+  },
+
+  // Harvard CURIOSity: LibraryCloud MMS-ID lookup, then the nrs URN manifest.
+  // DRS repo codes contain dots (FHCL.HOUGH). The nrs URL is returned because
+  // it redirects to whichever image-server version the object has. LibraryCloud
+  // is incomplete: some records resolve to nothing, and that is final.
+  {
+    name: 'Harvard CURIOSity',
+    pattern: /curiosity\.lib\.harvard\.edu\/[^\/]+\/catalog\/([^\/\?#]+)/,
+    async: true,
+    resolve: async function (url) {
+      const m = url.match(/curiosity\.lib\.harvard\.edu\/[^\/]+\/catalog\/([^\/\?#]+)/);
+      if (!m) return null;
+      const mms = m[1].replace(/^\d+-/, '');
+      try {
+        const r = await fetch('https://api.lib.harvard.edu/v2/items.json?q=' + encodeURIComponent(mms), { headers: { 'Accept': 'application/json' } });
+        if (!r.ok) return null;
+        const text = await r.text();
+        const urn = text.match(/urn-3:[A-Za-z0-9.]+:\d+/i);
+        if (!urn) return null;
+        return 'https://nrs.harvard.edu/' + urn[0] + ':MANIFEST';
+      } catch (e) { return null; }
+    }
+  },
+
+  // Library of Congress — item URLs
+  {
+    name: 'Library of Congress',
+    pattern: /loc\.gov\/item\/([^\/\?]+)/,
+    resolve: function (url) {
+      const m = url.match(/(https?:\/\/www\.loc\.gov\/item\/[^\/\?#]+)/);
+      if (!m) return null;
+      return m[1].replace(/\/+$/, '') + '/manifest.json';
+    }
+  },
+
+  // LoC Chronicling America — must precede the generic /resource/ handler
+  {
+    name: 'Library of Congress',
+    pattern: /loc\.gov\/resource\/([^\/\?#]+)\/(\d{4}-\d{2}-\d{2})\/ed-(\d+)/,
+    resolve: function (url) {
+      const m = url.match(/loc\.gov\/resource\/([^\/\?#]+)\/(\d{4}-\d{2}-\d{2})\/ed-(\d+)/);
+      if (!m) return null;
+      return 'https://www.loc.gov/item/' + m[1] + '/' + m[2] + '/ed-' + m[3] + '/manifest.json';
+    }
+  },
+
+  // LoC — generic resource URLs (?fo=json lookup; direct fetch, LoC serves ACAO *)
+  {
+    name: 'Library of Congress',
+    pattern: /loc\.gov\/resource\/(?!sn\d)([^\/\?]+)/,
+    async: true,
+    resolve: async function (url) {
+      const base = url.match(/(https?:\/\/www\.loc\.gov\/resource\/[^\/\?#]+)/);
+      if (!base) return null;
+      try {
+        const r = await fetch(base[1].replace(/\/+$/, '') + '/?fo=json');
+        if (!r.ok) return null;
+        const data = await r.json();
+        const lccn = data.segments && data.segments[0] && data.segments[0].number_lccn && data.segments[0].number_lccn[0];
+        if (!lccn) return null;
+        return 'https://www.loc.gov/item/' + lccn + '/manifest.json';
+      } catch (e) { return null; }
+    }
+  },
+
+  // BHL single-page URLs (/page/{pageid}) — must precede the item handler.
+  // The page HTML is WAF-protected (403s scripted clients), but the public
+  // /pagethumb/{pageid} route 302s to BHL's open S3 bucket at
+  //   …/web/{ia-identifier}/{ia-identifier}_{leaf}_thumb.jpg
+  // so one redirect yields both the IA id and the 1-based leaf number.
+  // Verified live 2026-07-28 across five arbitrary page ids.
+  {
+    name: 'Biodiversity Heritage Library',
+    pattern: /biodiversitylibrary\.org\/page\/(\d+)/,
+    async: true,
+    resolve: async function (url) {
+      const m = url.match(/biodiversitylibrary\.org\/page\/(\d+)/);
+      if (!m) return null;
+      try {
+        const r = await fetch('https://www.biodiversitylibrary.org/pagethumb/' + m[1], { redirect: 'follow' });
+        // the identifier appears twice (directory and filename stem) — the
+        // backreference keeps us from matching an unrelated path segment
+        const ia = r.url.match(/\/web\/([^\/]+)\/\1_(\d+)_/);
+        if (!ia) return null;
+        return 'https://iiif.archive.org/iiif/' + ia[1] + '/manifest.json';
+      } catch (e) { return null; }
+    }
+  },
+
+  // Biodiversity Heritage Library — page carries an archive.org identifier.
+  {
+    name: 'Biodiversity Heritage Library',
+    pattern: /biodiversitylibrary\.org\/(item|bibliography)\/(\d+)/,
+    async: true,
+    resolve: async function (url) {
+      try {
+        const r = await fetch(url);
+        const html = await r.text();
+        const m = html.match(/archive\.org\/details\/([^"]+)/);
+        if (!m) return null;
+        return 'https://iiif.archive.org/iiif/' + m[1] + '/manifest.json';
+      } catch (e) { return null; }
+    }
+  },
+
+  // Smithsonian Libraries — resolves to an Internet Archive identifier.
+  {
+    name: 'Smithsonian Libraries',
+    pattern: /library\.si\.edu\/digital-library\/book\/([^\/\?#]+)/,
+    async: true,
+    resolve: async function (url) {
+      const m = url.match(/library\.si\.edu\/digital-library\/book\/([^\/\?#]+)/);
+      if (!m) return null;
+      try {
+        const page = await fetch(url);
+        const html = await page.text();
+        const ia = html.match(/archive\.org\/(?:details|stream)\/([^"'\/#\?]+)/);
+        if (ia) return 'https://iiif.archive.org/iiif/' + ia[1] + '/manifest.json';
+      } catch (e) {}
+      return 'https://iiif.archive.org/iiif/' + m[1] + '/manifest.json';
+    }
+  },
+
+  // Cambridge Digital Library
+  {
+    name: 'Cambridge Digital Library',
+    pattern: /cudl\.lib\.cam\.ac\.uk\/view\/([^\/\?#]+)/,
+    resolve: function (url) {
+      const m = url.match(/cudl\.lib\.cam\.ac\.uk\/view\/([^\/\?#]+)/);
+      if (!m) return null;
+      return 'https://cudl.lib.cam.ac.uk/iiif/' + m[1];
+    }
+  },
+
+  // Yale Center for British Art: a separate site and manifest host from Yale
+  // Library. /catalog/tms:{id} → manifests.collections.yale.edu/ycba/obj/{id}
+  // (Presentation 3, ACAO *, homepage points back at the catalog page).
+  // A handler is the ONLY route here: the item pages sit behind a Cloudflare
+  // challenge that 403s scripted clients, so the page scan can never read them.
+  // Verified live 2026-10-01 on tms:2519, tms:34, tms:5005. Only the tms:
+  // (art collections) prefix is handled; orbis: (rare books) is unverified.
+  {
+    name: 'Yale Center for British Art',
+    pattern: /collections\.britishart\.yale\.edu\/catalog\/tms(?::|%3A)(\d+)/i,
+    resolve: function (url) {
+      const m = url.match(/collections\.britishart\.yale\.edu\/catalog\/tms(?::|%3A)(\d+)/i);
+      if (!m) return null;
+      return 'https://manifests.collections.yale.edu/ycba/obj/' + m[1];
+    }
+  },
+
+  // Wellcome Collection: /works/{id} (also /works/{id}/items). The manifest
+  // is keyed on a b-number that cannot be derived from the work id, so the
+  // catalogue API is asked for the work's iiif-presentation location. API,
+  // manifest and image service all serve ACAO *. Works with only an
+  // iiif-image location have no manifest and return null. Multi-volume works
+  // are sc:Collection wrappers; take volume 1.
+  // Verified live 2026-10-02 (dbdy7m9q, cyjkf4qq, ktru2dfx; d8quuwxg is a
+  // 3-volume collection).
+  {
+    name: 'Wellcome Collection',
+    pattern: /wellcomecollection\.org\/works\/([a-z0-9]+)/i,
+    async: true,
+    resolve: async function (url) {
+      const m = url.match(/wellcomecollection\.org\/works\/([a-z0-9]+)/i);
+      if (!m) return null;
+      try {
+        const r = await fetch('https://api.wellcomecollection.org/catalogue/v2/works/' + m[1] + '?include=items');
+        if (!r.ok) return null;
+        const w = await r.json();
+        let manifestUrl = null;
+        (w.items || []).forEach(function (it) {
+          (it.locations || []).forEach(function (l) {
+            if (!manifestUrl && l.locationType && l.locationType.id === 'iiif-presentation' && l.url) manifestUrl = l.url;
+          });
+        });
+        if (!manifestUrl) return null;
+        const mr = await fetch(manifestUrl);
+        if (!mr.ok) return null;
+        const mj = await mr.json();
+        if (mj['@type'] === 'sc:Collection') {
+          const vol = mj.manifests && mj.manifests[0];
+          return (vol && vol['@id']) || null;
+        }
+        return manifestUrl;
+      } catch (e) { return null; }
+    }
+  },
+
+  // Digital Bodleian: /objects/{uuid}/ maps to
+  // iiif.bodleian.ox.ac.uk/iiif/manifest/{uuid}.json (Presentation 2, paged,
+  // ACAO * on manifest and images). The object page is a JS app whose HTML
+  // never links the manifest. Verified live 2026-10-02 on four object ids
+  // from Bodleian's sitemap.
+  {
+    name: 'Digital Bodleian',
+    pattern: /digital\.bodleian\.ox\.ac\.uk\/objects\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i,
+    resolve: function (url) {
+      const m = url.match(/digital\.bodleian\.ox\.ac\.uk\/objects\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+      if (!m) return null;
+      return 'https://iiif.bodleian.ox.ac.uk/iiif/manifest/' + m[1].toLowerCase() + '.json';
+    }
+  },
+
+  // Biblissima IIIF Collections: an aggregator, so an entry page
+  // (/collections/manifest/{sha1}) points at a manifest hosted by the source
+  // library (Gallica, IRHT, BVH...), carried on the page as data-manifest.
+  // Verified live 2026-10-02.
+  {
+    name: 'Biblissima',
+    pattern: /iiif\.biblissima\.fr\/collections\/manifest\/([0-9a-f]{40})/i,
+    async: true,
+    resolve: async function (url) {
+      const m = url.match(/iiif\.biblissima\.fr\/collections\/manifest\/([0-9a-f]{40})/i);
+      if (!m) return null;
+      try {
+        const r = await fetch('https://iiif.biblissima.fr/collections/manifest/' + m[1].toLowerCase());
+        if (!r.ok) return null;
+        const dm = (await r.text()).match(/data-manifest="(https?:\/\/[^"]+)"/);
+        return dm ? dm[1].replace(/&amp;/g, '&') : null;
+      } catch (e) { return null; }
+    }
+  },
+
+  // Digital Scriptorium: union catalog of US manuscript collections. A record
+  // (/catalog/DS{n}) names a manifest hosted by the member library, in its
+  // iiif_manifest_link field; the record JSON route 500s, so the page is read.
+  // Verified live 2026-10-02 on six records.
+  {
+    name: 'Digital Scriptorium',
+    pattern: /search\.digital-scriptorium\.org\/catalog\/(DS\d+)/i,
+    async: true,
+    resolve: async function (url) {
+      const m = url.match(/search\.digital-scriptorium\.org\/catalog\/(DS\d+)/i);
+      if (!m) return null;
+      try {
+        const r = await fetch('https://search.digital-scriptorium.org/catalog/' + m[1].toUpperCase());
+        if (!r.ok) return null;
+        const dm = (await r.text()).match(/<dd[^>]*blacklight-iiif_manifest_link[^>]*>[\s\S]*?(https?:\/\/[^\s"<>]+)/);
+        return dm ? dm[1].replace(/&amp;/g, '&') : null;
+      } catch (e) { return null; }
+    }
+  },
+
+  // UCLA Digital Collections
+  {
+    name: 'UCLA Digital Collections',
+    pattern: /digital\.library\.ucla\.edu\/catalog\/(ark:\/\d+\/[^\/\?#]+)/,
+    resolve: function (url) {
+      const m = url.match(/digital\.library\.ucla\.edu\/catalog\/(ark:\/\d+\/[^\/\?#]+)/);
+      if (!m) return null;
+      try { return 'https://iiif.library.ucla.edu/' + encodeURIComponent(m[1]) + '/manifest'; }
+      catch (e) { return null; }
+    }
+  },
+
+  // Stanford SearchWorks (experimental): druid → PURL manifest
+  {
+    name: 'Stanford (SearchWorks)',
+    pattern: /searchworks\.stanford\.edu\/view\/([a-z]{2}\d{3}[a-z]{2}\d{4})/i,
+    resolve: function (url) {
+      const m = url.match(/searchworks\.stanford\.edu\/view\/([a-z]{2}\d{3}[a-z]{2}\d{4})/i);
+      if (!m) return null;
+      return 'https://purl.stanford.edu/' + m[1] + '/iiif/manifest';
+    }
+  },
+
+  // Dartmouth Digital Collections (experimental): SPA shell, but
+  // the manifest sits at a parallel /archive/iiif/ path with -mods.json suffix
+  {
+    name: 'Dartmouth Digital Collections',
+    pattern: /collections\.dartmouth\.edu\/archive\/object\/([^\/]+)\/([^\/\?#]+)/,
+    resolve: function (url) {
+      const m = url.match(/collections\.dartmouth\.edu\/archive\/object\/([^\/]+)\/([^\/\?#]+)/);
+      if (!m) return null;
+      return 'https://collections.dartmouth.edu/archive/iiif/' + m[1] + '/' + m[2] + '-mods.json';
+    }
+  },
+
+  // Northwestern University Libraries Digital Collections: work UUID in the item URL → v2 API
+  // ?as=iiif (Presentation 3). API is CORS-open (reflects Origin), no proxy.
+  {
+    name: 'Northwestern University Libraries Digital Collections',
+    pattern: /dc\.library\.northwestern\.edu\/items\/([^\/\?#]+)/,
+    resolve: function (url) {
+      const m = url.match(/dc\.library\.northwestern\.edu\/items\/([^\/\?#]+)/);
+      if (!m) return null;
+      return 'https://api.dc.library.northwestern.edu/api/v2/works/' + m[1] + '?as=iiif';
+    }
+  }
+];
+
+function detectPlatform(url) {
+  for (let i = 0; i < PLATFORMS.length; i++) {
+    if (PLATFORMS[i].pattern.test(url)) return PLATFORMS[i];
+  }
+  return null;
+}
+
+/* ── page-scan heuristics (ported from whatiiif heuristicResolve, with
+   per-candidate source labels). Pure regex over an HTML string: the content
+   script passes the rendered DOM's outerHTML (catches SPA state the static
+   HTML lacks), tests pass fetched HTML. Zero network — candidates here are
+   *leads*, validated only during deep scan. ── */
+
+// Trailing id-ish segment of a URL — used for derived guesses and ranking
+function trailingIdSegment(pageUrl) {
+  const base = pageUrl.replace(/[?#].*$/, '').replace(/\/+$/, '');
+  return (base.match(/([A-Za-z0-9._%-]{4,})$/) || [])[1] || null;
+}
+
+// Streaming-video manifests — every embedded video player talks about
+// "manifest" URLs and none of them are IIIF: MPEG-DASH (.mpd), HLS (.m3u8),
+// Smooth Streaming (.ism/Manifest, .ismc), HDS (.f4m), Azure Media's
+// /manifest(format=…). Central guard for every candidate path.
+function looksLikeVideoManifest(url) {
+  return /\.(mpd|m3u8|ism[cv]?|f4m)([?#]|$)/i.test(url) ||
+         /\.ism\/manifest/i.test(url) ||
+         /\/manifest\(format=/i.test(url);
+}
+
+// Resolve a scanned candidate (absolute, relative, or HTML-escaped) against
+// the page URL; http(s) only, Image API info.json excluded.
+// Streaming-video manifests and web-asset files (PWA .webmanifest, bundler
+// manifest.*.js) share the word "manifest" but can never be IIIF.
+function resolveCandidateUrl(raw, baseUrl) {
+  if (!raw) return null;
+  try {
+    const u = new URL(raw.replace(/&amp;/g, '&'), baseUrl);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+    if (/\/info\.json$/.test(u.pathname)) return null;
+    if (looksLikeVideoManifest(u.href)) return null;
+    if (/\.(webmanifest|js|mjs|css|map|appcache)([?#]|$)/i.test(u.pathname)) return null;
+    return u.href;
+  } catch (e) {}
+  return null;
+}
+
+function scanHtml(html, baseUrl) {
+  const found = [];   // {url, source} — insertion order encodes source priority
+  const push = function (raw, source) {
+    const abs = resolveCandidateUrl(raw, baseUrl);
+    if (abs) found.push({ url: abs, source: source });
+  };
+  // Viewer configs embed JSON with escaped slashes (https:\/\/…)
+  const hay = html.replace(/\\\//g, '/');
+  let m;
+
+  // HTML Signposting <link> tags (type must end at json or ;params —
+  // application/json+oembed is on practically every WordPress page)
+  const linkRe = /<link\b[^>]*>/gi;
+  while ((m = linkRe.exec(hay))) {
+    const tag = m[0];
+    if (!/rel=["'][^"']*\b(?:alternate|describedby)\b/i.test(tag)) continue;
+    if (!/type=["']application\/(?:ld\+)?json\s*(?:;|["'])/i.test(tag)) continue;
+    const h = tag.match(/href=["']([^"']+)["']/i);
+    if (h) push(h[1], 'signposting-html');
+  }
+  // Embedded viewer links: ?manifest=<url>
+  const qRe = /[?&](?:amp;)?manifest=([^&"'<>\s]+)/g;
+  while ((m = qRe.exec(hay))) {
+    let dec = m[1];
+    try { dec = decodeURIComponent(dec); } catch (e) {}
+    push(dec, 'viewer-link');
+  }
+  // Content-state links: ?iiif-content=<uri-or-token>
+  const csRe = /[?&](?:amp;)?iiif-content=([^&"'<>\s]+)/g;
+  while ((m = csRe.exec(hay))) {
+    let tok = m[1];
+    try { tok = decodeURIComponent(tok); } catch (e) {}
+    const cs = parseContentState(tok);
+    if (cs && cs.manifestId) push(cs.manifestId, 'content-state');
+  }
+  // Viewer-config JSON keys (value must contain a slash)
+  const keyRe = /["'](?:iiif[_-]?manifest|manifest[_-]?(?:url|uri|id)?)["']\s*:\s*["']([^"']*\/[^"']*)["']/gi;
+  while ((m = keyRe.exec(hay))) push(m[1], 'config-key');
+  // Embed-widget data attributes. data-manifest(-url) and data-iiif-* are
+  // explicit; bare data-uri (Universal Viewer's) is also used by video
+  // players and generic widgets, so its value must mention iiif/manifest.
+  const attrRe = /data-(iiif-)?(manifest(?:-url)?|uri)=["']([^"']*\/[^"']*)["']/gi;
+  while ((m = attrRe.exec(hay))) {
+    if (!m[1] && m[2] === 'uri' && !/iiif|manifest/i.test(m[3])) continue;
+    push(m[3], 'data-attribute');
+  }
+  // Any absolute URL mentioning "manifest"
+  const urlRe = /https?:\/\/[^"'<>\s\\]*manifest[^"'<>\s\\]*/gi;
+  while ((m = urlRe.exec(hay))) push(m[0], 'bare-url');
+
+  // Platform tells → derived guesses (unvalidated until deep scan)
+  const base = baseUrl.replace(/[?#].*$/, '').replace(/\/+$/, '');
+  const idSeg = trailingIdSegment(baseUrl);
+  // TIND (Berkeley digicoll, CERN…): manifest link built in JS, but the fixed
+  // route fragment sits in the markup (verified live 2026-07-12)
+  if (/\/export\/iiif_manifest/.test(hay)) found.push({ url: base + '/export/iiif_manifest', source: 'tind-route' });
+  // Image API thumbnails without a manifest link: on Digirati-style hosting
+  // the manifest lives at {host}/iiif/manifest/{page-id}.json (verified live:
+  // Bodleian 2026-07-12)
+  const im = hay.match(/(https?:\/\/[^"'<>\s\\\/]+)\/iiif\/image\//i);
+  if (im && idSeg) found.push({ url: im[1] + '/iiif/manifest/' + idSeg + '.json', source: 'image-api-host' });
+
+  return rankCandidates(dedupeByUrl(found), baseUrl);
+}
+
+// Keep first occurrence per URL — insertion order encodes source priority
+function dedupeByUrl(items) {
+  const seen = {};
+  return items.filter(function (it) {
+    if (seen[it.url]) return false;
+    seen[it.url] = true;
+    return true;
+  });
+}
+
+// Validation proves a candidate IS a manifest, not the RIGHT one — rank
+// candidates sharing the page URL's trailing id segment first (stable).
+function rankCandidates(items, pageUrl) {
+  const idSeg = trailingIdSegment(pageUrl);
+  if (!idSeg) return items;
+  const pref = [], rest = [];
+  items.forEach(function (it) { (it.url.indexOf(idSeg) !== -1 ? pref : rest).push(it); });
+  return pref.concat(rest);
+}
+
+// Blind suffix guesses — deep scan only (they're pure 404 probes on most sites)
+function suffixGuesses(pageUrl) {
+  const base = pageUrl.replace(/[?#].*$/, '').replace(/\/+$/, '');
+  return [
+    { url: base + '/manifest.json', source: 'suffix-guess' },
+    { url: base + '/manifest', source: 'suffix-guess' },
+    { url: base + '/iiif/manifest', source: 'suffix-guess' }
+  ];
+}
+
+export default {
+  SNIIIFFER_PROBE_CAP: SNIIIFFER_PROBE_CAP,
+  WHATIIIF_BASE: WHATIIIF_BASE,
+  looksLikeManifest: looksLikeManifest,
+  encodeContentState: encodeContentState,
+  buildManifestContentState: buildManifestContentState,
+  buildCanvasContentState: buildCanvasContentState,
+  buildWhatiiifHighlightUrl: buildWhatiiifHighlightUrl,
+  extractPageHint: extractPageHint,
+  getCanvases: getCanvases,
+  collectionManifests: collectionManifests,
+  unwrapCollection: unwrapCollection,
+  canvasIdOf: canvasIdOf,
+  resolveHintIndex: resolveHintIndex,
+  fullSizeParam: fullSizeParam,
+  getServiceBase: getServiceBase,
+  iiifUrl: iiifUrl,
+  getCanvasDimensions: getCanvasDimensions,
+  canvasImageUrls: canvasImageUrls,
+  decodeContentState: decodeContentState,
+  parseContentState: parseContentState,
+  parseSignpostingManifest: parseSignpostingManifest,
+  PLATFORMS: PLATFORMS,
+  detectPlatform: detectPlatform,
+  trailingIdSegment: trailingIdSegment,
+  looksLikeVideoManifest: looksLikeVideoManifest,
+  resolveCandidateUrl: resolveCandidateUrl,
+  scanHtml: scanHtml,
+  dedupeByUrl: dedupeByUrl,
+  rankCandidates: rankCandidates,
+  suffixGuesses: suffixGuesses
+};

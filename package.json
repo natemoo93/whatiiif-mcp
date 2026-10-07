@@ -1,0 +1,21 @@
+{
+  "name": "whatiiif-mcp",
+  "version": "0.1.0",
+  "description": "Remote MCP server for finding and citing primary sources via IIIF",
+  "license": "AGPL-3.0-or-later",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "inspect": "npx @modelcontextprotocol/inspector"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "^2.0.0",
+    "agents": "^0.24.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "wrangler": "^4.145.0"
+  }
+}
